@@ -36,8 +36,8 @@
 // ===========================
 // Enter your WiFi credentials
 // ===========================
-const char *ssid = "Konsol";
-const char *password = "20011116";
+const char *ssid = "vivo 1820";
+const char *password = "87654321";
 
 void startCameraServer();
 void setupLedFlash(int pin);
