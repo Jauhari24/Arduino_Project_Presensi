@@ -7,53 +7,64 @@
 #include <PubSubClient.h>
 
 // --- Konfigurasi Pin ---
-#define RST_PIN  D3    // RST RFID
-#define SDA_PIN  D4    // SDA RFID
-#define BUZZER_PIN D8  // Buzzer aktif HIGH
+#define RST_PIN  D3
+#define SDA_PIN  D4
+#define BUZZER_PIN D8
 
-// --- Objek RFID ---
 MFRC522 mfrc522(SDA_PIN, RST_PIN);
-
-// --- Objek LCD (I2C 0x27, ukuran 16x2) ---
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 
+// --- Variabel state ---
+enum Mode { LOGIN, REGISTER };
+Mode mode = LOGIN;
+unsigned long registerStartTime = 0;
+bool waitingRegister = false;
+
+String lastUID = "";
+unsigned long lastScanTime = 0;
+unsigned long cooldown = 3000; // 2 detik jeda antar-scan
+
+// --- MQTT Topics ---
+const char* t_login_status    = "alat/login_status";
+const char* t_register_status = "alat/register_status";
+const char* t_message         = "alat/message";
+const char* t_rfid_login      = "data/rfid/login";
+const char* t_rfid_register   = "data/rfid/register";
+
 // --- WiFi & MQTT ---
-const char* ssid = "vivo 1820";
-const char* password = "87654321";
-const char* mqtt_server = "7a92772b2a1b442e832825dd8d7aa2b1.s2.eu.hivemq.cloud";
-const int mqtt_port = 8883; // port TLS
+const char* ssid = "Konsol";
+const char* password = "20011116..";
+const char* mqtt_server = "5ca84e9de5c4426bb1862989f9503bbd.s1.eu.hivemq.cloud";
+const int mqtt_port = 8883;
 const char* mqtt_user = "Jauhari";
 const char* mqtt_pass = "Salam12345";
 
-
-
-// Client secure
 WiFiClientSecure espClientSecure;
 PubSubClient client(espClientSecure);
 
-// --- Data Kartu Terdaftar ---
-const int maxKartu = 10;
-String kartuTerdaftar[maxKartu] = {
-  "04 3A 8B 22",
-  "B3 5C 1A 9F"
-};
-int jumlahKartu = 2;
+// --- Fungsi Buzzer ---
+void beep(bool success) {
+  if (success) tone(BUZZER_PIN, 1000, 200);
+  else tone(BUZZER_PIN, 400, 500);
+}
 
-// --- Fungsi Koneksi WiFi ---
+// --- LCD ---
+void printLCD(const char* line1, const char* line2 = "") {
+  lcd.clear();
+  lcd.setCursor(0, 0); lcd.print(line1);
+  lcd.setCursor(0, 1); lcd.print(line2);
+}
+
+// --- Koneksi WiFi ---
 void setup_wifi() {
-  delay(10);
-  Serial.println();
   Serial.print("Menghubungkan ke ");
   Serial.println(ssid);
-
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
+    delay(500); Serial.print(".");
   }
   Serial.println("\nWiFi Terhubung!");
-  Serial.print("IP Address: ");
-  Serial.println(WiFi.localIP());
+  Serial.print("IP: "); Serial.println(WiFi.localIP());
 }
 
 // --- Reconnect MQTT ---
@@ -62,62 +73,69 @@ void reconnect() {
     Serial.print("Menghubungkan ke MQTT...");
     if (client.connect("ESP8266Client", mqtt_user, mqtt_pass)) {
       Serial.println("Terhubung!");
-      client.subscribe("alat/register"); // untuk mendaftarkan kartu
-      client.subscribe("alat/login");    // untuk login
+      client.subscribe(t_login_status);
+      client.subscribe(t_register_status);
+      client.subscribe(t_message);
+      client.subscribe(t_rfid_login);
+      client.subscribe(t_rfid_register);
     } else {
-      Serial.print("Gagal, rc=");
-      Serial.print(client.state());
-      Serial.println(" coba lagi...");
+      Serial.print("Gagal, rc="); Serial.println(client.state());
       delay(2000);
     }
   }
 }
 
-
-// --- Tambah Callback ---
+// --- MQTT Callback ---
 void callback(char* topic, byte* payload, unsigned int length) {
-  String message;
-  for (unsigned int i = 0; i < length; i++) {
-    message += (char)payload[i];
-  }
+  String msg;
+  for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
+  msg.trim();
+  String topicStr = String(topic);
 
-  Serial.print("Pesan diterima [");
-  Serial.print(topic);
-  Serial.print("]: ");
-  Serial.println(message);
+  Serial.printf("MQTT [%s]: %s\n", topic, msg.c_str());
 
-  // Register kartu baru
-  if (String(topic) == "alat/register") {
-    if (jumlahKartu < maxKartu) {
-      kartuTerdaftar[jumlahKartu] = message;
-      jumlahKartu++;
-      Serial.println("Kartu baru terdaftar: " + message);
-      client.publish("alat/feedback", ("Kartu terdaftar: " + message).c_str());
-    } else {
-      Serial.println("Daftar kartu penuh!");
-      client.publish("alat/feedback", "Daftar kartu penuh!");
+  if (topicStr == t_message) {
+    if (msg == "login_success") {
+      printLCD("Login", "Berhasil");
+      beep(true);
+    }
+    else if (msg == "login_failed") {
+      printLCD("Login", "Gagal");
+      beep(false);
+    }
+    else if (msg == "register_success") {
+      printLCD("Register", "Berhasil");
+      beep(true);
+      delay(3000); // tunggu 3 detik
+      mode = LOGIN;
+      waitingRegister = false;
+      printLCD("Mode Login", "Tempel Kartu");
+    }
+    else if (msg == "register_failed") {
+      printLCD("Register", "Gagal");
+      beep(false);
+    }
+    else {
+      // Pesan umum lainnya
+      printLCD(msg.c_str());
+      beep(true);
     }
   }
 
-  // Login via MQTT (validasi UID dari web/app)
-  if (String(topic) == "alat/login") {
-    bool cocok = false;
-    for (int i = 0; i < jumlahKartu; i++) {
-      if (message == kartuTerdaftar[i]) {
-        cocok = true;
-        break;
-      }
-    }
-    if (cocok) {
-      Serial.println("Login sukses untuk UID: " + message);
-      client.publish("alat/feedback", ("Login sukses: " + message).c_str());
-      tone(BUZZER_PIN, 1000, 200);
-    } else {
-      Serial.println("Login gagal untuk UID: " + message);
-      client.publish("alat/feedback", ("Login gagal: " + message).c_str());
-      tone(BUZZER_PIN, 400, 500);
-    }
+   if (topicStr == t_register_status && msg == "1") {
+    mode = REGISTER;
+    waitingRegister = true;
+    registerStartTime = millis();
+    printLCD("Mode Register", "Tempel Kartu");
+    beep(true);
   }
+  else {
+    mode = LOGIN;
+    waitingRegister = false;
+    printLCD("Mode Login", "Tempel Kartu");
+    beep(true);
+  }
+
 }
 
 void setup() {
@@ -128,36 +146,39 @@ void setup() {
   mfrc522.PCD_Init();
 
   // LCD
-  Wire.begin(D2, D1); // SDA, SCL
+  Wire.begin(D2, D1);
   lcd.init();
   lcd.backlight();
-  lcd.setCursor(0, 0);
-  lcd.print("Sistem Siap");
-  lcd.setCursor(0, 1);
-  lcd.print("Tempel Kartu");
+  printLCD("Sistem Siap", "Tempel Kartu");
 
   // Buzzer
   pinMode(BUZZER_PIN, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW);
 
-  // WiFi Secure & MQTT
+  // WiFi & MQTT
   setup_wifi();
-  espClientSecure.setInsecure(); // set sertifikat CA
+  espClientSecure.setInsecure();
   client.setServer(mqtt_server, mqtt_port);
   client.setCallback(callback);
 }
 
 void loop() {
-  if (!client.connected()) {
-    reconnect();
-  }
+  if (!client.connected()) reconnect();
   client.loop();
 
-  // Cek Kartu
+  // Timeout register mode (15 detik)
+  if (mode == REGISTER && waitingRegister && millis() - registerStartTime > 15000) {
+    mode = LOGIN;
+    waitingRegister = false;
+    printLCD("Mode Login", "Tempel Kartu");
+    beep(false);
+  }
+
+  // Cek kartu baru
   if (!mfrc522.PICC_IsNewCardPresent()) return;
   if (!mfrc522.PICC_ReadCardSerial()) return;
 
-  // Baca UID
+  // Ambil UID kartu
   String uid = "";
   for (byte i = 0; i < mfrc522.uid.size; i++) {
     if (mfrc522.uid.uidByte[i] < 0x10) uid += "0";
@@ -166,38 +187,28 @@ void loop() {
   }
   uid.toUpperCase();
 
-  Serial.println("UID: " + uid);
+  unsigned long now = millis();
 
-  // Kirim ke MQTT
-  String pesan = "Kartu: " + uid;
-  client.publish("esp8266/status", pesan.c_str());
-
-  // Cek apakah UID terdaftar
-  bool cocok = false;
-  for (int i = 0; i < jumlahKartu; i++) {
-    if (uid == kartuTerdaftar[i]) {
-      cocok = true;
-      break;
-    }
+  // Cegah spam: cek UID terakhir dan cooldown
+  if (uid == lastUID && (now - lastScanTime < cooldown)) {
+    Serial.println("Scan diabaikan (cooldown)");
+    return;
   }
 
-  if (cocok) {
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("Kartu Cocok");
-    lcd.setCursor(0, 1);
-    lcd.print(uid);
+  lastUID = uid;
+  lastScanTime = now;
 
-    tone(BUZZER_PIN, 1000, 200); // bunyi 200 ms
-  } else {
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("Kartu Tidak");
-    lcd.setCursor(0, 1);
-    lcd.print("Terdaftar");
-
-    tone(BUZZER_PIN, 400, 500); // bunyi 500 ms
+  // Mode login
+  if (mode == LOGIN) {
+    Serial.println("Login UID: " + uid);
+    client.publish(t_rfid_login, uid.c_str());
+    printLCD("Login...", uid.c_str());
+    beep(true);
   }
-
-  delay(1000);
+  // Mode register
+  else if (mode == REGISTER && waitingRegister) {
+    Serial.println("Register UID: " + uid);
+    client.publish(t_rfid_register, uid.c_str());
+    waitingRegister = false;
+  }
 }
